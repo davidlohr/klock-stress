@@ -1,0 +1,436 @@
+/*
+ * Copyright (C) 2005, Ingo Molnar <mingo@redhat.com>
+ */
+#include <unistd.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <linux/unistd.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdarg.h>
+#include <stdlib.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <linux/unistd.h>
+#include <unistd.h>
+#include <string.h>
+#include <pwd.h>
+#include <grp.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <regex.h>
+#include <fcntl.h>
+#include <time.h>
+#include <sys/mman.h>
+#include <dlfcn.h>
+#include <popt.h>
+#include <sys/socket.h>
+#include <ctype.h>
+#include <assert.h>
+#include <sched.h>
+
+#ifdef __ia64__
+#include <sys/ioctl.h>
+#include "mmtimer.h"
+int mmtimer_fd;
+
+unsigned long __mm_timer_clock_res;
+unsigned long *__mm_clock_dev;
+unsigned long __mm_clock_offset;
+#endif
+
+unsigned long *shared;
+
+#define mutex_lock()    gettimeofday((void *)0, (void *)10)
+#define mutex_unlock()  gettimeofday((void *)0, (void *)20)
+#define down()          gettimeofday((void *)0, (void *)100)
+#define up()            gettimeofday((void *)0, (void *)200)
+#define down_write()    gettimeofday((void *)0, (void *)1000)
+#define up_write()      gettimeofday((void *)0, (void *)2000)
+#define down_read()     gettimeofday((void *)0, (void *)10000)
+#define up_read()       gettimeofday((void *)0, (void *)20000)
+/*
+ * Shared locks and variables between the test tasks:
+ */
+#define CACHELINE_SIZE (128/sizeof(long))
+enum {
+	SHARED_DELTA_SUM		= 0*CACHELINE_SIZE,
+	SHARED_DELTA_MAX		= 1*CACHELINE_SIZE,
+	SHARED_DELTA2_SUM		= 2*CACHELINE_SIZE,
+	SHARED_DELTA2_MAX		= 3*CACHELINE_SIZE,
+	SHARED_DELTA3_SUM		= 4*CACHELINE_SIZE,
+	SHARED_DELTA3_MAX		= 5*CACHELINE_SIZE,
+	SHARED_DELTA_DELTA_SUM		= 6*CACHELINE_SIZE,
+	SHARED_COUNT			= 7*CACHELINE_SIZE,
+	SHARED_SUM			= 8*CACHELINE_SIZE,
+	SHARED_LOCK			= 9*CACHELINE_SIZE,
+	SHARED_END			= 10*CACHELINE_SIZE,
+};
+#define SHARED(x)	(*(shared + SHARED_##x))
+#define SHARED_LL(x)	(*(unsigned long long *)(shared + SHARED_##x))
+
+#define BUG_ON(c)	assert(!(c))
+
+static unsigned long *setup_shared_var(void)
+{
+	char zerobuff [4096] = { 0, };
+	int ret, fd;
+	unsigned long *buf;
+	char tmpfile[100];
+	sprintf(tmpfile, ".tmp_mmap-%d", getpid());
+
+	fd = creat(tmpfile, 0700);
+
+	BUG_ON(fd == -1);
+	close(fd);
+
+	fd = open(tmpfile, O_RDWR|O_CREAT|O_TRUNC);
+	unlink(tmpfile);
+	BUG_ON(fd == -1);
+	ret = write(fd, zerobuff, 4096);
+	BUG_ON(ret != 4096);
+	buf = (void *)mmap(0, 4096, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+	BUG_ON(buf == (void *)-1);
+	close(fd);
+
+	return buf;
+}
+#define LOOPS 10000
+#ifdef __ia64__
+static int setup_mmtimer(void)
+{
+	unsigned long regoff;
+	int fd, _t;
+	size_t pagesize;
+	if ((fd = open ("/dev/mmtimer", O_RDONLY)) == -1)
+		perror("missing /dev/mmtimer");
+	else {
+		pagesize = getpagesize();
+		__mm_clock_dev = mmap(0, pagesize, PROT_READ,
+				      MAP_SHARED, fd, 0);
+		if (__mm_clock_dev != MAP_FAILED) {
+			regoff = ioctl(fd, MMTIMER_GETOFFSET, 0);
+			if (regoff >= 0) {
+				__mm_clock_dev += regoff;
+				__mm_clock_offset = *__mm_clock_dev;
+			} else
+				perror("reg offset ioctl failed");
+			_t = ioctl(fd, MMTIMER_GETFREQ, &__mm_timer_clock_res);
+			if (_t)
+				perror("get freq ioctl fail");
+		}
+	}
+}
+
+#define ia64_fetchadd8_rel(p, inc)					\
+({									\
+	__u64 ia64_intri_res;						\
+	asm volatile ("fetchadd8.rel %0=[%1],%2"			\
+				: "=r"(ia64_intri_res) : "r"(p), "i" (inc) \
+				: "memory");				\
+									\
+	ia64_intri_res;							\
+})
+static inline void atomic_inc(unsigned long *flag)
+{
+	ia64_fetchadd8_rel(flag, 1);
+}
+static inline void atomic_dec(unsigned long *flag)
+{
+	ia64_fetchadd8_rel(flag, -1);
+}
+#elif defined(__i386__)
+static inline void atomic_inc(unsigned long *flag)
+{
+	__asm__ __volatile__(
+		"lock; incl %0\n"
+			     : "=g"(*flag) : : "memory");
+}
+static inline void atomic_dec(unsigned long *flag)
+{
+	__asm__ __volatile__(
+		"lock; decl %0\n"
+			     : "=g"(*flag) : : "memory");
+}
+#else
+static inline void atomic_inc(unsigned long *flag)
+{
+	++*flag;
+}
+static inline void atomic_dec(unsigned long *flag)
+{
+	--*flag;
+}
+#endif
+static void LOCK(unsigned long *shared)
+{
+	for (;;) {
+		atomic_inc(&SHARED(LOCK));
+		if (SHARED(LOCK) == 1)
+			break;
+		atomic_dec(&SHARED(LOCK));
+		usleep(1);
+	}
+}
+static void UNLOCK(unsigned long *shared)
+{
+	atomic_dec(&SHARED(LOCK));
+}
+
+static void sigint(int sig)
+{
+	atomic_inc(&SHARED(END));
+}
+static void print_status(unsigned long *shared)
+{
+	unsigned long count;
+	count = SHARED(COUNT);
+	SHARED(COUNT) = 0;
+	SHARED_LL(SUM) += count;
+
+	printf("\r| loops/sec: %ld    \r", count);
+	fflush(stdout);
+}
+enum {
+	TYPE_MUTEX,
+	TYPE_SEM,
+	TYPE_RSEM,
+	TYPE_WSEM,
+	TYPE_VFS,
+	NR_TYPES
+};
+const char * type_names[NR_TYPES] =
+	{	"Mutex",
+		"Semaphore",
+		"RW-semaphore Read",
+		"RW-semaphore Write",
+		"VFS"
+	};
+
+typedef unsigned long long cycles_t;
+typedef unsigned long long usecs_t;
+
+#ifdef __ia64__
+# define rdtscll(val)					\
+do {							\
+	val = *__mm_clock_dev;				\
+} while (0)
+#elif defined(__i386__)
+# define rdtscll(val)					\
+do {							\
+	__asm__ __volatile__("rdtsc" : "=A" (val));	\
+} while (0)
+#else
+# define rdtscll(val) \
+	do { (val) = 0LL; } while (0)
+#endif
+#define rdtod(val)					\
+do {							\
+	struct timeval tv;				\
+							\
+	gettimeofday(&tv, NULL);			\
+	(val) = tv.tv_sec * 1000000ULL + tv.tv_usec;	\
+} while (0)
+#define max(x,y) ({ \
+	typeof(x) _x = (x);	\
+	typeof(y) _y = (y);	\
+	(void) (&_x == &_y);		\
+	_x > _y ? _x : _y; })
+#define unlikely(x) __builtin_expect(!!(x), 0)
+
+int main(int argc, char **argv)
+{
+	int i, parent, me, first = 1;
+	unsigned long cpus, tasks, seconds = 0;
+	cycles_t t0, t01, t1, delta, delta2, delta3, delta_sum = 0,
+		delta2_sum = 0, delta3_sum = 0, delta_delta,
+		delta_delta_sum = 0, prev_delta,
+		delta_max = 0, delta2_max = 0, delta3_max = 0;
+	char str[100];
+	double freq;
+	int type;
+	if (argc <= 1 || argc > 4) {
+usage:
+		fprintf(stderr,
+			"usage: test-mutex [Mutex|Sem|Rsem|Wsem|Vfs creat+unlink] <threads> <seconds>\n");
+		exit(-1);
+usage2:
+		fprintf(stderr, "the Mutex/Sem/Rsem/Wsem tests are not available.\n");
+		goto usage;
+	}
+	switch (argv[1][0]) {
+		case 'M': type = TYPE_MUTEX; goto usage2; break;
+		case 'S': type = TYPE_SEM; goto usage2;  break;
+		case 'R': type = TYPE_RSEM; goto usage2; break;
+		case 'W': type = TYPE_WSEM; goto usage2; break;
+		case 'V': type = TYPE_VFS; break;
+		 default: goto usage;
+	}
+	system("rm -f /tmp/* 2>/dev/null >/dev/null");
+	cpus = system("exit `grep processor /proc/cpuinfo  | wc -l`");
+	cpus = WEXITSTATUS(cpus);
+	tasks = cpus;
+	if (argc >= 3) {
+		tasks = atol(argv[2]);
+		if (!tasks)
+			goto usage;
+	}
+	if (argc >= 4)
+		seconds = atol(argv[3]);
+	else
+		seconds = -1;
+#ifdef __ia64__
+	setup_mmtimer();
+#endif
+
+	printf("%ld CPUs, running %ld parallel test-tasks.\n", cpus, tasks);
+	printf("checking %s performance.\n", type_names[type]);
+
+	shared = setup_shared_var();
+
+	signal(SIGINT, sigint);
+	signal(SIGHUP, sigint);
+
+	parent = getpid();
+
+	for (i = 0; i < tasks; i++)
+		if (!fork())
+			break;
+	sleep(1);
+	me = getpid();
+	sprintf(str, "/tmp/tmp-%d", me);
+	if (me == parent) {
+		unsigned long long total_count;
+		int i = 0, j;
+		for (;;) {
+			sleep(1);
+			if (i == seconds || SHARED(END))
+				break;
+			i++;
+			print_status(shared);
+		}
+		atomic_inc(&SHARED(END));
+		total_count = SHARED(SUM);
+		for (j = 0; j < tasks; j++)
+			wait(NULL);
+		if (i)
+			printf("\navg ops/sec:               %Ld\n", total_count / i);
+		LOCK(shared);
+//		printf("delta_sum: %Ld\n", SHARED_LL(DELTA_SUM));
+//		printf("delta_delta_sum: %Ld\n", SHARED_LL(DELTA_DELTA_SUM));
+#ifdef __ia64__
+		freq = 25.0;
+#else
+		freq = 700.0;
+#endif
+		printf("average cost per op:       %.2f usecs\n",
+			(double)SHARED_LL(DELTA_SUM)/total_count/freq);
+		printf("average cost per lock:     %.2f usecs\n",
+			(double)SHARED_LL(DELTA2_SUM)/total_count/freq);
+		printf("average cost per unlock:   %.2f usecs\n",
+			(double)SHARED_LL(DELTA3_SUM)/total_count/freq);
+		printf("max cost per op:           %.2f usecs\n",
+			(double)SHARED_LL(DELTA_MAX)/freq);
+		printf("max cost per lock:         %.2f usecs\n",
+			(double)SHARED_LL(DELTA2_MAX)/freq);
+		printf("max cost per unlock:       %.2f usecs\n",
+			(double)SHARED_LL(DELTA3_MAX)/freq);
+		printf("average deviance per op:   %.2f usecs\n",
+			(double)SHARED_LL(DELTA_DELTA_SUM)/total_count/freq/2.0);
+		UNLOCK(shared);
+		exit(0);
+	}
+	for (;;) {
+		rdtscll(t0);
+		switch (type) {
+			case TYPE_MUTEX:
+				mutex_lock();
+				rdtscll(t01);
+				mutex_unlock();
+				break;
+			case TYPE_SEM:
+				down();
+				rdtscll(t01);
+				up();
+				break;
+			case TYPE_RSEM:
+				down_read();
+				rdtscll(t01);
+				up_read();
+				break;
+			case TYPE_WSEM:
+				down_write();
+				rdtscll(t01);
+				up_write();
+				break;
+			case TYPE_VFS:
+			{
+				int fd;
+				fd = creat(str, S_IRWXU);
+				rdtscll(t01);
+				close(fd);
+
+				break;
+			}
+		}
+		rdtscll(t1);
+		delta = t1-t0;
+		if (unlikely(delta > delta_max))
+			delta_max = delta;
+		delta_sum += delta;
+		delta2 = t01-t0;
+		if (unlikely(delta2 > delta2_max))
+			delta2_max = delta2;
+		delta2_sum += delta2;
+		delta3 = t1-t01;
+		if (unlikely(delta3 > delta3_max))
+			delta3_max = delta3;
+		delta3_sum += delta3;
+		if (!first) {
+			if (prev_delta < delta)
+				delta_delta = delta - prev_delta;
+			else
+				delta_delta = prev_delta - delta;
+			delta_delta_sum += delta_delta;
+#if 0
+			printf("%Ld-%Ld {%Ld} prev: {%Ld} / [%Ld]\n",
+				t0, t1, delta, prev_delta, delta_delta);
+			printf("  {%Ld} - {%Ld}\n",
+				delta_sum, delta_delta_sum);
+#endif
+		} else
+			first = 0;
+		prev_delta = delta;
+
+		atomic_inc(&SHARED(COUNT));
+
+		if (unlikely(SHARED(END))) {
+			LOCK(shared);
+			SHARED_LL(DELTA_SUM) += delta_sum;
+			SHARED_LL(DELTA_MAX) = max(SHARED_LL(DELTA_MAX),
+							delta_max);
+			SHARED_LL(DELTA2_SUM) += delta2_sum;
+			SHARED_LL(DELTA2_MAX) = max(SHARED_LL(DELTA2_MAX),
+							delta2_max);
+			SHARED_LL(DELTA3_SUM) += delta3_sum;
+			SHARED_LL(DELTA3_MAX) = max(SHARED_LL(DELTA3_MAX),
+							delta3_max);
+			SHARED_LL(DELTA_DELTA_SUM) += delta_delta_sum;
+#if 0
+			printf("delta_sum: %Ld\n", delta_sum);
+			printf("delta_delta_sum: %Ld\n", delta_delta_sum);
+			printf("DELTA_SUM: %Ld\n", SHARED_LL(DELTA_SUM));
+			printf("DELTA_DELTA_SUM: %Ld\n", SHARED_LL(DELTA_DELTA_SUM));
+#endif
+			UNLOCK(shared);
+			exit(0);
+		}
+	}
+	return 0;
+}
